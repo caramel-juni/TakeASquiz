@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# take-a-squiz_v12.sh — Multi-stage subdomain recon & security audit pipeline
+# take-a-squiz_v13.sh — Multi-stage subdomain recon & security audit pipeline
 #                       ♡ pink/purple "hack the planet" edition ♡
 #
 # Pipeline:
@@ -18,7 +18,7 @@
 #   S        Skip the current tool AND the rest of this stage
 #   Ctrl-C   Abort the ENTIRE pipeline (resume hint is printed on exit)
 #
-# What changed in v12 (vs v11):
+# What changed in v13 (vs v12):
 #   * Stage 4 naabu targets are editable, and wildcard-filtered IPs can be
 #     added back (interactively, in the TUI pane with CTRL-A, or via
 #     --naabu-add-wildcard-ips) so a single-wildcard-IP domain no longer
@@ -46,7 +46,7 @@ IFS=$'\n\t'
 # two tmux panes when --tui is used. See tui_launch_and_attach().
 ORIGINAL_ARGS=("$@")
 # ───────────────────────────── Globals / UI ─────────────────────────────────
-SCRIPT_NAME="take-a-squiz_v12.sh"
+SCRIPT_NAME="take-a-squiz_v13.sh"
 TS="$(date +%Y%m%d_%H%M%S)"
 BASE_OUT=""
 RUN_DIR=""
@@ -105,6 +105,15 @@ RESOLVERS_DEFAULT="/Users/kupteraz/Documents/hax0ring/WORDLISTS/SecLists/resolve
 PORT_SCOPE_DEFAULT="top1000"
 EXTRA_PORTS_DEFAULT="8080,8000,8008,8081,8888,3000,5000,5001,8009,9000,9090,9443,10443,10000"
 EXTRA_PORTS_ENABLED=1
+# "" = let naabu auto-pick (SYN if it has raw-socket privileges, else CONNECT).
+NAABU_SCAN_TYPE=""
+# "" = naabu's own default (1000 pkt/s). Lower this if obvious open ports
+# (80, 443, ...) go missing — it's almost always packet loss from scanning
+# too fast for the path (VPN, Wi-Fi, a rate-limiting firewall), not a bug
+# in naabu's target/port parsing.
+NAABU_RATE=""
+# "" = naabu's own default (3). Bump this for the same reason as NAABU_RATE.
+NAABU_RETRIES=""
 WILDCARD_FILTER=1
 # PROBE_WILDCARDS is a *default*, not a decision: unless the user passed
 # --probe-wildcards / --no-probe-wildcards (which set PROBE_WILDCARDS_SET=1),
@@ -150,7 +159,7 @@ banner() {
     echo -e "${grad[$i]}${C_BOLD}${line}${C_RESET}"
     i=$(( (i + 1) % ${#grad[@]} ))
   done
-  echo -e "${C_LILAC}     ♡ hack the planet ♡  ${C_DIM}v12 — pink & purple edition${C_RESET}"
+  echo -e "${C_LILAC}     ♡ hack the planet ♡  ${C_DIM}v13 — pink & purple edition${C_RESET}"
   echo -e "${C_DIM}   discovery ${C_PINK}→${C_DIM} permutations ${C_PINK}→${C_DIM} resolution ${C_PINK}→${C_DIM} ports ${C_PINK}→${C_DIM} http ${C_PINK}→${C_DIM} nuclei ${C_PINK}→${C_DIM} archive ${C_PINK}→${C_DIM} report${C_RESET}"
   echo
 }
@@ -551,6 +560,9 @@ load_resume_manifest() {
       port_scope) [[ -n "$val" ]] && PORT_SCOPE_DEFAULT="$val" ;;
       extra_ports) EXTRA_PORTS_DEFAULT="$val" ;;
       extra_ports_enabled) [[ "$val" =~ ^[01]$ ]] && EXTRA_PORTS_ENABLED="$val" ;;
+      naabu_scan_type) [[ "$val" =~ ^(s|c)$ ]] && NAABU_SCAN_TYPE="$val" ;;
+      naabu_rate) [[ "$val" =~ ^[0-9]+$ ]] && NAABU_RATE="$val" ;;
+      naabu_retries) [[ "$val" =~ ^[0-9]+$ ]] && NAABU_RETRIES="$val" ;;
       wildcard_filter) [[ "$val" =~ ^[01]$ ]] && WILDCARD_FILTER="$val" ;;
       probe_wildcards) [[ "$val" =~ ^[01]$ ]] && PROBE_WILDCARDS="$val" ;;
       probe_wildcards_set) cli_was_set probe_wildcards || { [[ "$val" =~ ^[01]$ ]] && PROBE_WILDCARDS_SET="$val"; } ;;
@@ -1876,6 +1888,15 @@ run_stage4() {
   if ! module_confirm naabu "Run naabu port scan on $(count_lines "$naabu_input") unique IP/CIDR targets?"; then warn "Skipping naabu"; return; fi
 
   local scope; scope="$(ask "Port scope: [top100 / top1000 / all / custom range]" "$PORT_SCOPE_DEFAULT")"
+  # Sanitize custom ranges: port 0 isn't a real TCP port, and a leading
+  # "0-N" (e.g. someone typing "0-3000" expecting "all ports up to 3000")
+  # can make naabu choke on or silently mis-handle the range. Rewrite it to
+  # the equivalent valid range instead of silently losing ports.
+  if [[ "$scope" =~ ^0+-([0-9]+)$ ]]; then
+    local fixed_scope="1-${BASH_REMATCH[1]}"
+    warn "Port scope '$scope' starts at port 0 (not a valid TCP port) — using '$fixed_scope' instead."
+    scope="$fixed_scope"
+  fi
   local -a port_flag=()
   case "$scope" in
     top100) port_flag=(-top-ports 100) ;;
@@ -1883,6 +1904,21 @@ run_stage4() {
     all) port_flag=(-p -) ;;
     *) port_flag=(-p "$scope") ;;
   esac
+  # Reliability flags, shared by every naabu invocation below:
+  #  -Pn / -skip-host-discovery — naabu's pre-scan "is this host alive" check
+  #     needs the same raw-socket privileges as a SYN scan, and silently
+  #     fails closed (host treated as dead, 0 ports reported — even obvious
+  #     ones like 80/443) when it doesn't have them, or when ICMP/SYN-ACK is
+  #     simply filtered on the path. Skipping it means naabu always actually
+  #     probes every requested port on every target instead of trusting an
+  #     unreliable pre-check — the #1 cause of "naabu misses obvious ports".
+  #  -scan-type / -rate / -retries — optional overrides (--naabu-scan-type,
+  #     --naabu-rate, --naabu-retries) for when packet loss from scanning too
+  #     fast, or a non-root SYN/raw-socket limitation, is dropping real ports.
+  local -a naabu_reliability_flags=(-Pn)
+  [[ -n "$NAABU_SCAN_TYPE" ]] && naabu_reliability_flags+=(-scan-type "$NAABU_SCAN_TYPE")
+  [[ -n "$NAABU_RATE" ]] && naabu_reliability_flags+=(-rate "$NAABU_RATE")
+  [[ -n "$NAABU_RETRIES" ]] && naabu_reliability_flags+=(-retries "$NAABU_RETRIES")
   info "naabu targets: $(count_lines "$naabu_input") unique IP/CIDR entries"
   info "naabu primary port scope: $scope"
   # -stats makes naabu print its own periodic progress, which the heartbeat
@@ -1891,7 +1927,7 @@ run_stage4() {
   SPIN_WATCH_LABEL="open ports"
   SPIN_TIMEOUT="$NAABU_TIMEOUT"
   run_spinner "naabu (${scope})" "$stage4_dir/naabu_primary.log" \
-    naabu -list "$naabu_input" "${port_flag[@]}" -stats -silent -no-color -o "$stage4_dir/naabu_primary.txt"
+    naabu -list "$naabu_input" "${port_flag[@]}" "${naabu_reliability_flags[@]}" -stats -silent -no-color -o "$stage4_dir/naabu_primary.txt"
   local rc=$?
   [[ "$rc" -eq 131 ]] && { warn "Rest of stage 4 skipped."; }
   if [[ "$rc" -ne 0 && "$rc" -ne 130 && "$rc" -ne 124 && "$rc" -ne 125 && "$rc" -ne 131 ]]; then
@@ -1904,7 +1940,7 @@ run_stage4() {
     SPIN_WATCH_LABEL="open ports"
     SPIN_TIMEOUT="$NAABU_TIMEOUT"
     run_spinner "naabu (extra/common non-standard ports)" "$stage4_dir/naabu_extra.log" \
-      naabu -list "$naabu_input" -p "$EXTRA_PORTS_DEFAULT" -stats -silent -no-color -o "$stage4_dir/naabu_extra.txt"
+      naabu -list "$naabu_input" -p "$EXTRA_PORTS_DEFAULT" "${naabu_reliability_flags[@]}" -stats -silent -no-color -o "$stage4_dir/naabu_extra.txt"
     rc=$?
     [[ "$rc" -ne 0 && "$rc" -ne 130 && "$rc" -ne 131 && "$rc" -ne 124 && "$rc" -ne 125 ]] && warn "naabu extra-port scan failed (rc=$rc)"
   else
@@ -2192,7 +2228,21 @@ run_stage5() {
           --timeout 20 \
           --screenshot-path "$stage6_screenshots_dir" \
           --screenshot-format jpeg \
-          --write-jsonl-file "$stage6_screenshots_jsonl"
+          --write-jsonl --write-jsonl-file "$stage6_screenshots_jsonl"
+      # gowitness's chromedp driver logs every CDP event type it doesn't
+      # specifically handle (page.EventFrameSubtreeWillBeDetached,
+      # dom.EventScrollableFlagUpdated, ...) straight to stderr as "ERROR:
+      # unhandled ... event". These are harmless — they fire on practically
+      # every page load and don't affect whether a screenshot gets taken —
+      # but they can drown out the handful of actually useful "INFO result"
+      # lines in both the live pane and the saved log. Strip them from the
+      # saved log after the run so the log (and the report's log viewer)
+      # stay readable; nothing about the scan itself is affected.
+      if [[ -s "$stage5_dir/gowitness.log" ]]; then
+        grep -Ev '^[0-9/: ]+ERROR: unhandled (page|node) event ' \
+          "$stage5_dir/gowitness.log" > "$stage5_dir/gowitness.log.tmp" 2>/dev/null &&
+          mv "$stage5_dir/gowitness.log.tmp" "$stage5_dir/gowitness.log"
+      fi
       ok "gowitness captured $(count_lines "$stage6_screenshots_jsonl") screenshot(s) -> $stage6_screenshots_dir"
     fi
   else
@@ -2287,6 +2337,46 @@ run_stage6() {
   fi
   ok "nuclei stage complete — $(count_lines "$nuclei_raw") finding line(s)"
 }
+# A deliberately small heuristic list of common two-label public-suffix TLDs
+# (co.uk, com.au, ...) — not a full public suffix list, just enough so
+# base_domain_of() doesn't truncate e.g. "foo.co.uk" down to "co.uk".
+_TWO_LABEL_TLDS=" co.uk org.uk gov.uk ac.uk me.uk net.uk ltd.uk plc.uk sch.uk nhs.uk police.uk \
+co.nz net.nz org.nz govt.nz ac.nz \
+co.za org.za gov.za net.za \
+co.jp ne.jp or.jp ac.jp go.jp \
+co.kr or.kr ne.kr \
+co.in net.in org.in gov.in ac.in \
+co.id or.id go.id ac.id \
+co.th or.th in.th ac.th go.th \
+com.au net.au org.au edu.au gov.au asn.au id.au \
+com.br net.br org.br gov.br \
+com.mx gob.mx org.mx \
+com.sg net.sg org.sg edu.sg gov.sg \
+com.hk org.hk gov.hk edu.hk net.hk \
+com.tw org.tw gov.tw edu.tw net.tw \
+com.cn net.cn org.cn gov.cn edu.cn \
+co.il org.il net.il gov.il ac.il \
+com.tr org.tr gov.tr edu.tr net.tr \
+com.ar gob.ar org.ar net.ar \
+com.ua co.ve co.ke co.tz com.ng com.pk com.eg "
+# Collapses a hostname down to its registrable base domain, e.g.
+# "blog.dev.foo.example.com" -> "example.com", "foo.co.uk" -> "foo.co.uk".
+# Used so waymore (see below) is queried once per unique apex domain instead
+# of once per resolved subdomain.
+base_domain_of() {
+local host; host="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+local -a labels
+  IFS='.' read -r -a labels <<< "$host"
+local n=${#labels[@]}
+if (( n <= 2 )); then printf '%s\n' "$host"; return; fi
+local last2="${labels[$((n-2))]}.${labels[$((n-1))]}"
+if [[ " $_TWO_LABEL_TLDS " == *" $last2 "* ]]; then
+if (( n <= 3 )); then printf '%s\n' "$host"; return; fi
+    printf '%s\n' "${labels[$((n-3))]}.${labels[$((n-2))]}.${labels[$((n-1))]}"
+else
+    printf '%s\n' "$last2"
+fi
+}
 # ───────────────────────────── Stage 7 ───────────────────────────────────────
 #
 # Archive is intentionally late in the pipeline so these (slow, provider
@@ -2338,32 +2428,65 @@ run_stage7() {
   local host idx rc=0
 
   # ── waymore ───────────────────────────────────────────────────────────────
+  # waymore's own docs call out passing a file of subdomains as "a common
+  # mistake" — a bare apex domain (no -n/--no-subs) already pulls archived
+  # URLs for every subdomain the Wayback/CDX-style providers know about in
+  # ONE query, so looping it per resolved subdomain just repeats the same
+  # work $n times and hammers the providers. Run it once per target domain
+  # instead (the apex domains the run was actually pointed at, i.e. $DOMAINS
+  # — not every individual resolved subdomain host).
   if tool_ready waymore waymore "Run waymore to pull archived URLs?"; then
     local wm_out="$stage8_archive_dir/waymore_urls.txt"
     : > "$wm_out"
-    idx=0
-    while read -r host; do
-      [[ -z "$host" ]] && continue
-      idx=$((idx + 1))
-      local -a waymore_args=(
-        -i "$host"
-        -mode U
-        -oU "$stage8_archive_dir/waymore_${host}.txt"
-      )
-      if [[ -n "$WAYMORE_CONFIG" ]]; then
-        waymore_args=(-c "$WAYMORE_CONFIG" "${waymore_args[@]}")
+    if [[ "${#DOMAINS[@]}" -eq 0 ]]; then
+      warn "No target domains available (IP/CIDR-only run) — skipping waymore."
+    else
+      # Collapse $DOMAINS down to unique base/apex domains before looping —
+      # if the run was pointed at subdomains directly (e.g. a host list from
+      # an earlier recon pass: blog.foo.com, dev.foo.com, docs.foo.com, ...)
+      # this still queries waymore once per apex (foo.com), not once per
+      # subdomain, which is both faster and what waymore's own docs
+      # recommend (see comment above).
+      local -a waymore_base_domains=()
+      local _wd _bd
+      {
+        for _wd in "${DOMAINS[@]}"; do
+          [[ -z "$_wd" ]] && continue
+          base_domain_of "$_wd"
+        done
+      } | sort -u > "$stage8_archive_dir/waymore_base_domains.txt"
+      while IFS= read -r _bd; do
+        [[ -z "$_bd" ]] && continue
+        waymore_base_domains+=("$_bd")
+      done < "$stage8_archive_dir/waymore_base_domains.txt"
+      if [[ "${#waymore_base_domains[@]}" -lt "${#DOMAINS[@]}" ]]; then
+        info "Collapsed ${#DOMAINS[@]} target domain(s) down to ${#waymore_base_domains[@]} unique base domain(s) for waymore."
       fi
-      SPIN_PROGRESS="host $idx/$total_h: $host"
-      SPIN_WATCH="$stage8_archive_dir/waymore_${host}.txt"
-      SPIN_WATCH_LABEL="urls"
-      SPIN_TIMEOUT="$WAYMORE_TIMEOUT"
-      SPIN_STALL_KILL="$WAYMORE_TIMEOUT"
-      run_spinner "waymore" "$stage8_archive_dir/waymore_${host}.log" \
-        waymore "${waymore_args[@]}"
-      rc=$?
-      cat "$stage8_archive_dir/waymore_${host}.txt" 2>/dev/null >> "$wm_out" || true
-      [[ "$rc" -eq 131 ]] && break
-    done < "$archive_hosts"
+      local total_d="${#waymore_base_domains[@]}"
+      idx=0
+      for host in "${waymore_base_domains[@]}"; do
+        [[ -z "$host" ]] && continue
+        idx=$((idx + 1))
+        local -a waymore_args=(
+          -i "$host"
+          -mode U
+          -oU "$stage8_archive_dir/waymore_${host}.txt"
+        )
+        if [[ -n "$WAYMORE_CONFIG" ]]; then
+          waymore_args=(-c "$WAYMORE_CONFIG" "${waymore_args[@]}")
+        fi
+        SPIN_PROGRESS="domain $idx/$total_d: $host"
+        SPIN_WATCH="$stage8_archive_dir/waymore_${host}.txt"
+        SPIN_WATCH_LABEL="urls"
+        SPIN_TIMEOUT="$WAYMORE_TIMEOUT"
+        SPIN_STALL_KILL="$WAYMORE_TIMEOUT"
+        run_spinner "waymore" "$stage8_archive_dir/waymore_${host}.log" \
+          waymore "${waymore_args[@]}"
+        rc=$?
+        cat "$stage8_archive_dir/waymore_${host}.txt" 2>/dev/null >> "$wm_out" || true
+        [[ "$rc" -eq 131 ]] && break
+      done
+    fi
     sort -u "$wm_out" -o "$wm_out"
     ok "waymore total archived URLs: $(count_lines "$wm_out")"
   else
@@ -2405,13 +2528,20 @@ run_stage7() {
   # ── xnLinkFinder ──────────────────────────────────────────────────────────
   if tool_ready xnlinkfinder xnLinkFinder.py "Run xnLinkFinder to extract links?"; then
     local xn_out="$stage8_archive_dir/xnlinkfinder_links.txt"
-    local wm_out="$stage8_archive_dir/waymore_urls.txt"
-    local xn_input="$wm_out"
-    if [[ ! -s "$xn_input" && -s "$stage8_archive_dir/gau_urls.txt" ]]; then
-      xn_input="$stage8_archive_dir/gau_urls.txt"
-    fi
-    if [[ ! -s "$xn_input" ]]; then
-      xn_input="$archive_hosts"
+    # xnLinkFinder should be given fetchable URLs, not bare hostnames or a
+    # historical archive URL corpus. Build one HTTPS homepage URL per target;
+    # this mirrors `xnLinkFinder -i https://example.com -sf scope.txt`.
+    local xn_input="$stage8_archive_dir/xnlinkfinder_input.txt"
+    {
+      [[ "${#DOMAINS[@]}" -gt 0 ]] && printf '%s\\n' "${DOMAINS[@]}"
+      cat "$archive_hosts" 2>/dev/null
+      [[ -s "$stage5_dir/httpx_live_urls.txt" ]] && cat "$stage5_dir/httpx_live_urls.txt"
+    } | sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##; /^$/d; s#^[A-Za-z]+://##; s#[:/].*$##' |
+      awk 'NF' | sort -u | sed 's#^#https://#' > "$xn_input"
+    # Prefer known-live URLs from httpx (preserving http/https), then use the
+    # HTTPS-prefixed target list above for domains without a live URL.
+    if [[ -s "$stage5_dir/httpx_live_urls.txt" ]]; then
+      cp "$stage5_dir/httpx_live_urls.txt" "$xn_input"
     fi
     local xn_cmd
     if command -v xnLinkFinder.py >/dev/null 2>&1; then
@@ -2437,6 +2567,7 @@ run_stage7() {
       SPIN_WATCH="$xn_out"
       SPIN_WATCH_LABEL="links"
       SPIN_TIMEOUT=1800
+      info "xnLinkFinder input: $xn_input ($(count_lines "$xn_input") URLs); scope: $xn_scope"
       # PYTHONWARNINGS silences the harmless requests/urllib3 version warning
       # that otherwise floods the TUI pane.
       run_spinner "xnLinkFinder" "$stage8_archive_dir/xnlinkfinder.log" \
@@ -2510,37 +2641,62 @@ build_timing_rows() {
 # to $RUN_DIR (where report.html lives), e.g. 5_http/screenshots/foo.jpeg,
 # so the report stays portable if the whole $RUN_DIR is copied/zipped together.
 build_screenshot_rows() {
-local jsonl="$1"
-local shots_dir="$2"
-if [[ ! -s "$jsonl" ]] || ! have jq; then
-    echo "<tr><td colspan=4><em>no screenshots / jq missing</em></td></tr>"
-return
-fi
-local shots_rel
-  shots_rel="$(basename "$shots_dir")"
-  jq -r '
-    [
-      (.url // "-"),
-      (.response_code // .status_code // "-" | tostring),
-      (.title // "-"),
-      (.filename // .screenshot_file // .screenshot // "-")
-    ]
-    | join("\u001f")
-  ' "$jsonl" 2>/dev/null |
-while IFS=$'\x1f' read -r s_url s_code s_title s_file; do
-local fname img_cell
-    fname="$(basename "$s_file" 2>/dev/null)"
-if [[ -n "$fname" && "$fname" != "-" && -f "$shots_dir/$fname" ]]; then
-      img_cell="<a href=\"5_http/${shots_rel}/$(echo "$fname" | html_escape)\" target=\"_blank\"><img class=\"shot-thumb\" loading=\"lazy\" src=\"5_http/${shots_rel}/$(echo "$fname" | html_escape)\" alt=\"\"></a>"
-else
-      img_cell="<em>no capture</em>"
-fi
+  local jsonl="$1"
+  local shots_dir="$2"
+  if [[ ! -s "$jsonl" ]] || ! have jq; then
+    echo "<tr><td colspan=4><em>no screenshot metadata / jq missing</em></td></tr>"
+    return
+  fi
+
+  local shots_rel="screenshots"
+  local row_count=0
+  # Gowitness versions differ in the JSONL key used for the image path. Resolve
+  # all known variants, then fall back to a filename match against the URL host.
+  while IFS= read -r json_line || [[ -n "$json_line" ]]; do
+    [[ -n "$json_line" ]] || continue
+    local s_url s_code s_title s_file fname img_cell host host_key candidate candidate_key
+    s_url="$(printf '%s\n' "$json_line" | jq -r '.url // .target // "-"' 2>/dev/null)"
+    s_code="$(printf '%s\n' "$json_line" | jq -r '(.response_code // .status_code // .status // "-") | tostring' 2>/dev/null)"
+    s_title="$(printf '%s\n' "$json_line" | jq -r '.title // .page_title // "-"' 2>/dev/null)"
+    s_file="$(printf '%s\n' "$json_line" | jq -r '.filename // .screenshot_file // .screenshot_path // .screenshotPath // .screenshot // .path // .file // .file_path // .image // empty' 2>/dev/null)"
+    fname=""
+    if [[ -n "$s_file" ]]; then
+      fname="$(basename "$s_file" 2>/dev/null)"
+      [[ -f "$shots_dir/$fname" ]] || fname=""
+    fi
+
+    # Some gowitness releases omit the screenshot path from JSONL entirely.
+    # Match the host against saved image names (gowitness commonly sanitises
+    # URL punctuation in filenames); this keeps the metadata row useful.
+    if [[ -z "$fname" && "$s_url" != "-" ]]; then
+      host="$(printf '%s' "$s_url" | sed -E 's#^[A-Za-z]+://##; s#[/?#].*$##; s#:[0-9]+$##' | tr '[:upper:]' '[:lower:]')"
+      host_key="$(printf '%s' "$host" | sed -E 's/[^A-Za-z0-9]+/_/g')"
+      while IFS= read -r candidate; do
+        [[ -f "$candidate" ]] || continue
+        candidate_key="$(basename "$candidate" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/_/g')"
+        if [[ -n "$host_key" && "$candidate_key" == *"$host_key"* ]]; then
+          fname="$(basename "$candidate")"
+          break
+        fi
+      done < <(find "$shots_dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) 2>/dev/null)
+    fi
+
+    if [[ -n "$fname" && -f "$shots_dir/$fname" ]]; then
+      img_cell="<a href=\"5_http/${shots_rel}/$(echo "$fname" | html_escape)\" target=\"_blank\"><img class=\"shot-thumb\" loading=\"lazy\" src=\"5_http/${shots_rel}/$(echo "$fname" | html_escape)\" alt=\"Screenshot of $(echo "$s_url" | html_escape)\"></a>"
+    else
+      img_cell="<em>capture saved, image path not matched</em>"
+    fi
     printf '<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n' \
       "$img_cell" \
       "$(echo "$s_url" | html_escape)" \
       "$(echo "$s_code" | html_escape)" \
       "$(echo "$s_title" | html_escape)"
-done
+    row_count=$((row_count + 1))
+  done < "$jsonl"
+
+  if [[ "$row_count" -eq 0 ]]; then
+    echo "<tr><td colspan=4><em>no valid screenshot metadata rows</em></td></tr>"
+  fi
 }
 # Builds collapsible <pre> log viewers for every file matching a glob
 # pattern (e.g. "$RUN_DIR/5_http/httpx*.log"). Each gets its own toggle
@@ -3072,6 +3228,15 @@ Usage: $SCRIPT_NAME [-t target] [-o output_dir] [-m modules] [-w waymore_config]
   --resolvers PATH          Resolver list for shuffledns/puredns.
   --ports SCOPE             Primary port scope (top100, top1000, all, 1-65535, 80,443,8080).
   --extra-ports PORTS       Also scan these ports after the primary scope.
+  --naabu-scan-type TYPE    syn | connect. Default: let naabu auto-pick (SYN if it
+                            has raw-socket privileges, else CONNECT). Force
+                            "connect" if obvious open ports (80, 443, ...) are
+                            going missing — it's slower but doesn't depend on
+                            privileges or a kernel that lets SYN replies through.
+  --naabu-rate N            Packets/sec for naabu. Default: naabu's own (1000).
+                            Lower it (e.g. 200-300) if scans are dropping real
+                            open ports — that's packet loss, not a parsing bug.
+  --naabu-retries N         Per-port retries for naabu. Default: naabu's own (3).
   --no-extra-ports          Disable the additional non-standard port pass.
 
  Wildcard handling
@@ -3147,6 +3312,15 @@ case "$1" in
     --ports) PORT_SCOPE_DEFAULT="${2:-top1000}"; cli_set port_scope; shift 2 ;;
     --extra-ports) EXTRA_PORTS_DEFAULT="${2:-}"; EXTRA_PORTS_ENABLED=1; cli_set extra_ports; cli_set extra_ports_enabled; shift 2 ;;
     --no-extra-ports) EXTRA_PORTS_ENABLED=0; cli_set extra_ports_enabled; shift ;;
+    --naabu-scan-type)
+      case "${2:-}" in
+        syn) NAABU_SCAN_TYPE="s"; cli_set naabu_scan_type ;;
+        connect) NAABU_SCAN_TYPE="c"; cli_set naabu_scan_type ;;
+        *) warn "--naabu-scan-type must be 'syn' or 'connect' — ignoring '${2:-}'." ;;
+      esac
+      shift 2 ;;
+    --naabu-rate) [[ "${2:-}" =~ ^[0-9]+$ ]] && { NAABU_RATE="$2"; cli_set naabu_rate; }; shift 2 ;;
+    --naabu-retries) [[ "${2:-}" =~ ^[0-9]+$ ]] && { NAABU_RETRIES="$2"; cli_set naabu_retries; }; shift 2 ;;
     --no-wildcard-filter) WILDCARD_FILTER=0; cli_set wildcard_filter; shift ;;
     --probe-wildcards) PROBE_WILDCARDS=1; PROBE_WILDCARDS_SET=1; cli_set probe_wildcards; shift ;;
     --no-probe-wildcards) PROBE_WILDCARDS=0; PROBE_WILDCARDS_SET=1; cli_set probe_wildcards; shift ;;
@@ -3290,6 +3464,9 @@ resolvers=${RESOLVERS_DEFAULT:-default/prompt}
 port_scope=$PORT_SCOPE_DEFAULT
 extra_ports=$EXTRA_PORTS_DEFAULT
 extra_ports_enabled=$EXTRA_PORTS_ENABLED
+naabu_scan_type=$NAABU_SCAN_TYPE
+naabu_rate=$NAABU_RATE
+naabu_retries=$NAABU_RETRIES
 wildcard_filter=$WILDCARD_FILTER
 probe_wildcards=$PROBE_WILDCARDS
 probe_wildcards_set=$PROBE_WILDCARDS_SET
