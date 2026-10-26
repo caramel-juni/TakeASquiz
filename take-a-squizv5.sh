@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# take-a-squiz_v13.sh — Multi-stage subdomain recon & security audit pipeline
+# take-a-squizv6.sh — Multi-stage subdomain recon & security audit pipeline
 #                       ♡ pink/purple "hack the planet" edition ♡
 #
 # Pipeline:
@@ -18,7 +18,7 @@
 #   S        Skip the current tool AND the rest of this stage
 #   Ctrl-C   Abort the ENTIRE pipeline (resume hint is printed on exit)
 #
-# What changed in v13 (vs v12):
+# What changed in v6 (based on v13):
 #   * Stage 4 naabu targets are editable, and wildcard-filtered IPs can be
 #     added back (interactively, in the TUI pane with CTRL-A, or via
 #     --naabu-add-wildcard-ips) so a single-wildcard-IP domain no longer
@@ -46,7 +46,7 @@ IFS=$'\n\t'
 # two tmux panes when --tui is used. See tui_launch_and_attach().
 ORIGINAL_ARGS=("$@")
 # ───────────────────────────── Globals / UI ─────────────────────────────────
-SCRIPT_NAME="take-a-squiz_v13.sh"
+SCRIPT_NAME="take-a-squizv6.sh"
 TS="$(date +%Y%m%d_%H%M%S)"
 BASE_OUT=""
 RUN_DIR=""
@@ -285,7 +285,7 @@ return 0
         [[ "$name" == "nuclei" ]] && return 0
 ;;
       7|archive)
-        [[ "$name" =~ ^(waymore|gau|xnlinkfinder)$ ]] && return 0
+        [[ "$name" =~ ^(waymore|gau)$ ]] && return 0
 ;;
       8|report)
         [[ "$name" == "report" ]] && return 0
@@ -334,7 +334,7 @@ return 0
 fi
 ;;
     archive)
-for m in waymore gau xnlinkfinder; do
+for m in waymore gau; do
 if module_enabled "$m"; then
 return 0
 fi
@@ -457,11 +457,6 @@ export PATH
 tool_path() {
 local name="$1"
 case "$name" in
-    xnLinkFinder.py)
-      command -v xnLinkFinder.py 2>/dev/null ||
-      command -v xnLinkFinder 2>/dev/null ||
-return 1
-;;
 *)
       command -v "$name" 2>/dev/null || return 1
 ;;
@@ -958,7 +953,7 @@ TOOL_FOR_STAGE_3="dnsx"
 TOOL_FOR_STAGE_4="naabu"
 TOOL_FOR_STAGE_5="httpx katana"
 TOOL_FOR_STAGE_6="nuclei"
-TOOL_FOR_STAGE_7="waymore gau xnLinkFinder.py"
+TOOL_FOR_STAGE_7="waymore gau"
 stage_tools() {
 local stage="$1"
 case "$stage" in
@@ -984,7 +979,6 @@ local -a all=(
     alterx
     waymore
     gau
-    xnLinkFinder.py
     naabu
     httpx
     katana
@@ -1026,7 +1020,7 @@ if [[ "${#MISSING_TOOLS[@]}" -gt 0 ]]; then
     echo -e "${C_DIM}    go install github.com/projectdiscovery/alterx/cmd/alterx@latest${C_RESET}"
     echo -e "${C_DIM}    go install github.com/d3mondev/puredns/v2@latest${C_RESET}"
     echo -e "${C_DIM}    go install github.com/lc/gau/v2/cmd/gau@latest${C_RESET}"
-    echo -e "${C_DIM}    pip install waymore xnLinkFinder${C_RESET}"
+    echo -e "${C_DIM}    pip install waymore${C_RESET}"
 fi
 if ! have gowitness; then
     echo -e "${C_DIM}    (optional, for stage 5 screenshots) go install github.com/sensepost/gowitness@latest${C_RESET}"
@@ -2129,6 +2123,21 @@ run_stage5() {
         -ss -srd "$stage5_dir/screenshots" -hash sha256 \
         -timeout 10 -retries 1 -stats -silent -o "$stage6_httpx" -json -no-color
 
+    # -probe makes httpx also print a row for every FAILED probe (failed:true).
+    # Keep the full set for reference, but only let successful responses
+    # through as "live" so katana/gowitness/nuclei don't chew
+    # through dead ports (Cloudflare 2052/2082/..., http on 8443, etc.).
+    if have jq && [[ -s "$stage6_httpx" ]]; then
+      cp "$stage6_httpx" "$stage5_dir/httpx_all_probes.txt"
+      if jq -c 'select(.failed != true)' "$stage5_dir/httpx_all_probes.txt" > "$stage5_dir/.httpx_ok.tmp" 2>/dev/null; then
+        mv "$stage5_dir/.httpx_ok.tmp" "$stage6_httpx"
+        info "httpx: dropped $(( $(count_lines "$stage5_dir/httpx_all_probes.txt") - $(count_lines "$stage6_httpx") )) failed probe(s); $(count_lines "$stage6_httpx") responded."
+      else
+        rm -f "$stage5_dir/.httpx_ok.tmp"
+        warn "Could not filter failed httpx probes (jq error) — keeping all rows."
+      fi
+    fi
+
     # Remove responses which exactly match a wildcard baseline for the same
     # IP:port. Intentionally conservative: status + size + content type +
     # body hash must ALL match. Anything different survives.
@@ -2386,7 +2395,12 @@ run_stage7() {
   section "STAGE 7 — Archived/historical URL discovery"
   stage_skip_reset
   stage8_archive_dir="$RUN_DIR/7_archive"
+  local stage5_dir="$RUN_DIR/5_http"
   mkdir -p "$stage8_archive_dir"
+
+  # stage5_dir is local to run_stage5, so re-derive it here (also needed
+  # when stage 5 was completed by a previous invocation and we are resuming).
+  local stage5_dir="$RUN_DIR/5_http"
 
   # The real cause of "waymore/gau hangs for hours" is usually volume: one
   # slow provider request per host, times hundreds of hosts. Cap the host
@@ -2525,65 +2539,10 @@ run_stage7() {
     : > "$stage8_archive_dir/gau_urls.txt"
   fi
 
-  # ── xnLinkFinder ──────────────────────────────────────────────────────────
-  if tool_ready xnlinkfinder xnLinkFinder.py "Run xnLinkFinder to extract links?"; then
-    local xn_out="$stage8_archive_dir/xnlinkfinder_links.txt"
-    # xnLinkFinder should be given fetchable URLs, not bare hostnames or a
-    # historical archive URL corpus. Build one HTTPS homepage URL per target;
-    # this mirrors `xnLinkFinder -i https://example.com -sf scope.txt`.
-    local xn_input="$stage8_archive_dir/xnlinkfinder_input.txt"
-    {
-      [[ "${#DOMAINS[@]}" -gt 0 ]] && printf '%s\\n' "${DOMAINS[@]}"
-      cat "$archive_hosts" 2>/dev/null
-      [[ -s "$stage5_dir/httpx_live_urls.txt" ]] && cat "$stage5_dir/httpx_live_urls.txt"
-    } | sed -E 's#^[[:space:]]+##; s#[[:space:]]+$##; /^$/d; s#^[A-Za-z]+://##; s#[:/].*$##' |
-      awk 'NF' | sort -u | sed 's#^#https://#' > "$xn_input"
-    # Prefer known-live URLs from httpx (preserving http/https), then use the
-    # HTTPS-prefixed target list above for domains without a live URL.
-    if [[ -s "$stage5_dir/httpx_live_urls.txt" ]]; then
-      cp "$stage5_dir/httpx_live_urls.txt" "$xn_input"
-    fi
-    local xn_cmd
-    if command -v xnLinkFinder.py >/dev/null 2>&1; then
-      xn_cmd="xnLinkFinder.py"
-    else
-      xn_cmd="xnLinkFinder"
-    fi
-    # xnLinkFinder >= 6 makes -sf/--scope-filter mandatory whenever the input
-    # is a domain/URL (or a file of them). Without it the tool prints a usage
-    # error and exits having extracted nothing. The scope file holds the root
-    # domains plus every archive host (bare names, no scheme; subdomains of a
-    # listed domain are in scope).
-    local xn_scope="$stage8_archive_dir/xnlinkfinder_scope.txt"
-    {
-      [[ "${#DOMAINS[@]}" -gt 0 ]] && printf '%s\n' "${DOMAINS[@]}"
-      cat "$archive_hosts" 2>/dev/null
-    } | sed -E 's#^[a-zA-Z]+://##; s#[:/].*$##; s#^\*\.##' |
-      awk 'NF' | sort -u > "$xn_scope"
-    : > "$xn_out"
-    if [[ ! -s "$xn_scope" ]]; then
-      warn "No in-scope domains available for xnLinkFinder — skipping."
-    else
-      SPIN_WATCH="$xn_out"
-      SPIN_WATCH_LABEL="links"
-      SPIN_TIMEOUT=1800
-      info "xnLinkFinder input: $xn_input ($(count_lines "$xn_input") URLs); scope: $xn_scope"
-      # PYTHONWARNINGS silences the harmless requests/urllib3 version warning
-      # that otherwise floods the TUI pane.
-      run_spinner "xnLinkFinder" "$stage8_archive_dir/xnlinkfinder.log" \
-        env PYTHONWARNINGS=ignore \
-        "$xn_cmd" -i "$xn_input" -o "$xn_out" -sf "$xn_scope"
-    fi
-    ok "xnLinkFinder extracted $(count_lines "$xn_out") links"
-  else
-    warn "Skipping xnLinkFinder"
-  fi
-
   # ── unified URL corpus ────────────────────────────────────────────────────
   cat \
     "$stage8_archive_dir/waymore_urls.txt" \
     "$stage8_archive_dir/gau_urls.txt" \
-    "$stage8_archive_dir/xnlinkfinder_links.txt" \
     2>/dev/null |
     sed '/^[[:space:]]*$/d' |
     sort -u > "$stage8_archive_dir/all_urls.txt" || true
